@@ -1,0 +1,35 @@
+[project]
+name = "fireclaw-search-mcp"
+version = "0.1.0"
+description = "MCP server that exposes Firecrawl /v2/search, /v2/scrape, and /v2/team/credit-usage as tools for any modern AI agent. Built on FastMCP 4.0.11 against MCP 2026-07-28."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "fireclaw-search-mcp contributors" }]
+keywords = ["mcp", "model-context-protocol", "firecrawl", "search", "scrape", "fastmcp"]
+dependencies = [
+    "fastmcp==4.0.11",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+fireclaw-search-mcp = "fireclaw_search_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fireclaw_search_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"

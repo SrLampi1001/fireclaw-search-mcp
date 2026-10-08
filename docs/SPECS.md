@@ -1,46 +1,52 @@
-# `rust-agent-firecrawl-mcp` — MCP server
+# `fireclaw-search-mcp` — MCP server
 
-> **Status:** spec only, not yet implemented. The behaviour described below is the **minimum required to be considered a viable replacement for the current `web_search_deep` tool**. Implementation happens in this repo; integration with the agent happens by editing `config/mcp.toml` in the `rust-agent` repo. (/home/srlampi/Documents/projects/rust-agent/)
+> **Status:** v0.1 implemented. Speaks MCP 2026-07-28 over Streamable HTTP and stdio, built on FastMCP 4.0.11. The behaviour described below is the contract this server commits to.
 
-A [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes a single deep-search tool to the `rust-agent` over stdio:
+A [Model Context Protocol](https://modelcontextprotocol.io/specification/2026-07-28) server that exposes the Firecrawl `/v2/search`, `/v2/scrape`, and `/v2/team/credit-usage` endpoints as MCP tools for any modern AI agent. No agent-specific integration; runs as a standalone streamable HTTP server that any modern MCP client can connect to.
 
-| Tool | Backend | Cost | Best for |
-| --- | --- | --- | --- |
-| `web_search` | Firecrawl `/v2/search` with `scrape_options.formats=["markdown"]` | 1,000 credits/month free tier; ~2–7 credits per call | Complex, long-tail, or question-shaped queries that need the **full page contents** as clean markdown. |
+| Tool | Backend | Best for |
+| --- | --- | --- |
+| `web_search` | Firecrawl `/v2/search` with `scrape_options.formats=["markdown"]` | Complex, long-tail, or question-shaped queries that need the **full page contents** as clean markdown. Costs Firecrawl credits. |
+| `scrape_url` | Firecrawl `/v2/scrape` with `formats=["markdown"]` | Fetching a known single URL (a documentation page, an issue, an API reference) the model already has a pointer to. Costs 1+ credits. |
+| `credit_status` | Firecrawl `/v2/team/credit-usage` | Reading the current credit balance without burning any. |
 
-The Rust agent spawns this server as a child process via the official [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) crate, lists the tool, and registers it as a regular `rig::tool::Tool`. From the agent's point of view the tool is indistinguishable from any other.
+| Prompt | Use |
+| --- | --- |
+| `research_topic` | Plan a single `web_search` call, including the empty-result fallback. |
+| `fetch_document` | Plan a single `scrape_url` call, telling the model to focus on a specific question. |
 
 ---
 
 ## 1. Why this server exists
 
-This server is one of **three** that together replace the current bundled `mcp-servers/web-search/` MCP. The bundle is being split so each backend (DDG, Firecrawl, Tavily) can be enabled, disabled, scaled, and rate-limited independently. The agent code is **unaware** of the split — it still sees one `web_search`-shaped tool per server, with the server-name prefix disambiguating which backend answered.
+Firecrawl is the **deep** path against the free-tier budget (1,000 credits/month on the default plan). Where a free snippet-only tool (e.g. `duck-search-mcp`) is fine for entity-like queries, `web_search` returns each result's full page body as clean markdown — useful for long-tail, question-shaped, or otherwise complex queries where snippets aren't enough. `scrape_url` covers the "I already have a URL and just need the page" case. `credit_status` lets the model peek at its budget without burning anything.
 
-Firecrawl is the **deep** path. Where the DDG tool returns snippets only, this tool returns each result's full page body as clean markdown — useful for long-tail, question-shaped, or otherwise complex queries where snippets aren't enough. The cost is Firecrawl credits, which the agent must budget. Every response includes a `credits` snapshot so the calling model can see the balance drop across calls and switch to the free path (`duckduckgo__web_search` or `tavily__web_search`) when it gets low.
+Every `web_search` and `scrape_url` response includes a `credits` snapshot (`remaining_credits`, `plan_credits`, `billing_period_end`) so the calling agent can see its balance drop across calls and decide to switch to a free tool when it gets low. The minimum-credits guard refuses calls that would drop below the configured threshold, surfacing a clear error so the model can react.
 
-The other two MCPs in the set:
-
-- **DuckDuckGo** for entity-like queries (free, no key, snippets only).
-- **Tavily** for general question-shaped queries (free tier, agent-tuned structured results, no markdown body by default — `firecrawl__web_search` is the right tool when the model genuinely needs the page contents).
+This server does not try to replace general free search. For entity-like queries, prefer a sibling MCP that hits a free endpoint (e.g. `duck-search-mcp`). For everything that genuinely needs full page contents, reach for `web_search` here.
 
 ---
 
 ## 2. Protocol contract
 
-The agent (per [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) §8) requires:
+The server is built on **FastMCP 4.0.11** and targets the **MCP 2026-07-28** revision. It is dual-era out of the box — modern clients negotiate the stateless protocol, legacy clients that send `initialize` still get a working session.
 
-1. Speaks **MCP 2024-11-05** (the version `rmcp 0.8` negotiates).
-2. Accepts JSON-args objects on `tools/call`.
-3. Returns either `structured_content` (preferred) or at least one text content block.
-4. Advertises at least one tool on `tools/list`.
+| Contract | Value |
+| --- | --- |
+| Protocol revision | `2026-07-28` (advertised via `server/discover`; legacy `initialize` negotiates `2025-11-25`) |
+| Transports | Streamable HTTP at `/mcp` (default), stdio (opt-in via `FIRECRAWL_TRANSPORT=stdio`) |
+| Bind address | `127.0.0.1` (loopback only; expose via VS Code port forwarding or ngrok — see `docs/DEPLOYMENT.md`) |
+| Authentication | **None.** Loopback binding is the only access control. Operate behind a trusted tunnel. |
+| Required response fields | `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` headers; tool list advertises `ttlMs`/`cacheScope` |
+| Server features | `tools` (three), `prompts` (two), `resources/templates` (none), `extensions: io.modelcontextprotocol/ui` |
 
-Anything beyond this contract is a server-side decision.
+Any modern MCP client (Claude Desktop, Cursor, opencode, VS Code Copilot Chat) that supports Streamable HTTP can connect to the forwarded URL without code changes.
 
 ---
 
-## 3. Tool
+## 3. Tools
 
-### `web_search` (single tool)
+### 3.1 `web_search`
 
 **Input schema** (JSON Schema, surfaced verbatim to the model):
 
@@ -48,9 +54,12 @@ Anything beyond this contract is a server-side decision.
 {
   "type": "object",
   "properties": {
-    "query":       { "type": "string",  "description": "..." },
-    "max_results": { "type": "integer", "minimum": 1, "maximum": 10,
-                     "default": 5,      "description": "..." }
+    "query":          { "type": "string",  "description": "...",
+                        "minLength": 1 },
+    "max_results":    { "type": "integer", "description": "...",
+                        "default": 5 },
+    "force_refresh":  { "type": "boolean", "description": "...",
+                        "default": false }
   },
   "required": ["query"],
   "additionalProperties": false
@@ -59,8 +68,9 @@ Anything beyond this contract is a server-side decision.
 
 | Argument | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `query` | string | yes | – | The search query. The Firecrawl API takes the query as `q`. |
-| `max_results` | integer | no | 5 | Number of search results to return. Clamped to `[1, 10]`. Each result is scraped for markdown, so a larger value costs more credits and dumps more into context. |
+| `query` | string | yes | – | The search query. Trimmed before any cache lookup; the trimmed query is echoed in the response. |
+| `max_results` | integer | no | 5 | Max results to return. **Clamped** to `[1, 10]` server-side (out-of-range values are not rejected, they are clamped). Each result is scraped for markdown, so a larger value costs more credits and dumps more into context. |
+| `force_refresh` | boolean | no | false | Bypass the on-disk cache and re-query Firecrawl even when a fresh-enough entry exists. Use when the user explicitly asks for fresh results, or when a previous result is known to be stale. |
 
 **Output** (`structured_content`, a JSON object):
 
@@ -70,248 +80,415 @@ Anything beyond this contract is a server-side decision.
   "results": [
     { "title": "...",
       "url":   "...",
+      "description": "...",
       "markdown": "...",
       "markdown_chars": 12345,
-      "markdown_truncated_chars": 8000 }
+      "markdown_truncated_chars": 8000,
+      "truncated": true }
   ],
   "credits_used_this_call": 7,
   "credits": {
     "remaining_credits": 812,
     "plan_credits": 1000,
-    "billing_period_end": "2025-11-01T00:00:00+00:00"
+    "billing_period_end": "2026-11-01T00:00:00+00:00"
   },
-  "cache": "miss" | "hit"
+  "cache": "miss" | "hit" | "bypassed"
 }
 ```
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `query` | string | The query as the server received it. |
-| `results` | array of `{title, url, markdown, markdown_chars, markdown_truncated_chars}` | See below. Capped at `max_results`. |
-| `credits_used_this_call` | integer | From the Firecrawl `search` response's `creditsUsed` field. The server subtracts this from its in-memory counter. |
+| `query` | string | The query as the server received it (after `trim()`). |
+| `results` | array of `{title, url, description, markdown, markdown_chars, markdown_truncated_chars, truncated}` | Mapped from Firecrawl's `data.web[]`. Capped at `max_results`. |
+| `credits_used_this_call` | integer | From the Firecrawl `search` response's `creditsUsed` field. The server subtracts this from its in-memory counter. `0` on a cache hit. |
 | `credits` | object | `{remaining_credits, plan_credits, billing_period_end}` — the current balance, refreshed by the startup probe and decremented by each call. |
-| `cache` | `"miss"` or `"hit"` | Whether the response was served from the on-disk Firecrawl cache. |
+| `cache` | `"miss"`, `"hit"`, or `"bypassed"` | Tells the model whether this call hit the cache, the network, or whether the caller opted out of the cache. |
 
 **Per-result fields:**
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `title` | string | From the Firecrawl search result metadata. |
+| `title` | string | From the Firecrawl `search` result metadata. |
 | `url` | string | The canonical URL. |
-| `markdown` | string | The page body as clean markdown, **truncated to `DEEP_MAX_MARKDOWN_CHARS` (default 8000) per result**. A `…truncated…` marker is appended so the model can see the cut. |
+| `description` | string | The search-engine description (when Firecrawl returns one and scrape options don't request a body). |
+| `markdown` | string | The page body as clean markdown, **truncated to `FIRECRAWL_MAX_MARKDOWN_CHARS` (default 8000) per result**. A truncation marker is appended when truncation happened so the model can see the cut. |
 | `markdown_chars` | integer | The original body length **before** truncation. Lets the model know how much was left out. |
 | `markdown_truncated_chars` | integer | The cut length (≤ `markdown_chars`). Equal when no truncation happened. |
+| `truncated` | boolean | `true` when the markdown was truncated. |
 
 **Description (the model reads this verbatim):**
 
-> Paid, deep web search via Firecrawl. Reach for this **only** when the question is complex, long-tail, or you genuinely need the **full page contents** as clean markdown — not just snippets.
-> Costs Firecrawl credits (~2–7 per call, depending on `max_results`). Every response includes a `credits` snapshot: check `remaining_credits` and switch to `duckduckgo__web_search` or `tavily__web_search` once it drops under ~50. Per-result markdown is capped at ~8k chars to protect the agent's context budget; the `markdown_chars` / `markdown_truncated_chars` fields tell you how much was cut.
-> Use `max_results` to cap the result list (default 5, max 10).
+> Deep web search via Firecrawl. Reach for this when the question is complex, long-tail, or you genuinely need the **full page contents** as clean markdown — not just snippets. Costs Firecrawl credits (the free tier is 1,000/month; a typical call uses 2–7 credits). Every response includes a `credits` snapshot — check `remaining_credits` and switch to a free search tool once it drops under ~50. Per-result markdown is capped at ~8k chars to protect context; the `markdown_chars` / `markdown_truncated_chars` fields tell you how much was cut. Pass `force_refresh=true` when the user explicitly wants fresh results or you know a previous result is stale.
+
+### 3.2 `scrape_url`
+
+**Input schema** (JSON Schema, surfaced verbatim to the model):
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "url":           { "type": "string",  "description": "...",
+                       "format": "uri",
+                       "minLength": 1 },
+    "force_refresh": { "type": "boolean", "description": "...",
+                       "default": false }
+  },
+  "required": ["url"],
+  "additionalProperties": false
+}
+```
+
+| Argument | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `url` | string | yes | – | The URL to scrape. Must be a syntactically valid HTTP/HTTPS URL. The cache key is the canonical URL. |
+| `force_refresh` | boolean | no | false | Bypass the on-disk cache. Use when the page is known to have changed or the user explicitly asks for fresh content. |
+
+**Output** (`structured_content`, a JSON object):
+
+```json
+{
+  "url": "https://example.com/docs",
+  "final_url": "https://example.com/docs",
+  "title": "Example Docs",
+  "markdown": "...",
+  "markdown_chars": 12345,
+  "markdown_truncated_chars": 8000,
+  "truncated": true,
+  "metadata": {
+    "title": "Example Docs",
+    "description": "...",
+    "language": "en",
+    "source_url": "https://example.com/docs",
+    "url": "https://example.com/docs",
+    "status_code": 200
+  },
+  "credits_used_this_call": 1,
+  "credits": {
+    "remaining_credits": 812,
+    "plan_credits": 1000,
+    "billing_period_end": "2026-11-01T00:00:00+00:00"
+  },
+  "cache": "miss" | "hit" | "bypassed"
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `url` | string | The URL as the server received it. |
+| `final_url` | string | The URL after redirects (from `metadata.url`). |
+| `title` | string | The page title from `metadata.title`. |
+| `markdown` | string | The page body as clean markdown. Truncated to `FIRECRAWL_MAX_MARKDOWN_CHARS` per result. |
+| `markdown_chars` | integer | Original body length before truncation. |
+| `markdown_truncated_chars` | integer | The cut length (≤ `markdown_chars`). Equal when no truncation happened. |
+| `truncated` | boolean | `true` when the markdown was truncated. |
+| `metadata` | object | The subset of Firecrawl's `metadata` the model is most likely to read: `title`, `description`, `language`, `source_url`, `url`, `status_code`. |
+| `credits_used_this_call` | integer | From the Firecrawl `scrape` response's `metadata.creditsUsed` or `creditsUsed` field where exposed. `0` on a cache hit. |
+| `credits` | object | Live credit snapshot, same shape as `web_search`. |
+| `cache` | `"miss"`, `"hit"`, or `"bypassed"` | Tells the model whether the call hit the cache, the network, or whether the caller opted out. |
+
+**Description (the model reads this verbatim):**
+
+> Scrape a single known URL via Firecrawl. Reach for this after a prior search pointed at the page, or when the user already gave you the URL. Costs 1+ credits (more for large / complex pages). Returns the page body as clean markdown, with `metadata` for the title, description, language, and post-redirect URL. Per-page markdown is capped at ~8k chars to protect context; the `markdown_chars` / `markdown_truncated_chars` fields tell you how much was cut. Pass `force_refresh=true` when the user explicitly wants fresh content or you know the page has changed since the cache was populated.
+
+### 3.3 `credit_status`
+
+**Input schema** (empty):
+
+```json
+{
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}
+```
+
+**Output** (`structured_content`, a JSON object):
+
+```json
+{
+  "credits": {
+    "remaining_credits": 812,
+    "plan_credits": 1000,
+    "billing_period_end": "2026-11-01T00:00:00+00:00"
+  },
+  "source": "live" | "cached",
+  "note": ""
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `credits` | object | The current credit snapshot. |
+| `source` | `"live"` or `"cached"` | `live` is a fresh `GET /v2/team/credit-usage` call. `cached` means the in-memory counter was used (probe at startup, or last successful call's decrement). |
+| `note` | string | Non-empty when the startup probe never succeeded. Tells the model the snapshot is best-effort. |
+
+**Description (the model reads this verbatim):**
+
+> Read the current Firecrawl credit balance for the configured key. Does NOT burn credits (it hits the `/v2/team/credit-usage` metadata endpoint, then falls back to the in-memory counter on transient errors). Use this to check your budget before issuing an expensive batch of calls.
 
 ---
 
-## 4. Credit tracking
+## 4. Response mapping (Firecrawl → MCP)
 
-This is the most important piece of operational logic in the server. Firecrawl costs credits; the model needs to know how many it has left, and the server needs to refuse calls that would exhaust them.
+Both tools apply a small mapping layer from Firecrawl's raw JSON onto the flat `structured_content` documented above.
 
-The tracking has two parts:
+### 4.1 `web_search`
 
-1. **Startup probe** — when the server starts, it calls `Firecrawl.get_credit_usage()` once and caches `remaining_credits`, `plan_credits`, and `billing_period_end` in memory. The probe is a metadata endpoint; it doesn't consume credits. If it fails, the server starts with `remaining_credits = 0` and the first call will see a clear "credits unknown" error.
-2. **Per-call decrement** — every `search()` response includes a `creditsUsed` field. The server subtracts that from the cached counter after a successful call, so the running balance stays accurate without re-probing.
+Firecrawl `/v2/search` returns:
 
-**Pre-call guard:** before every call, the server checks the cached counter and raises `is_error: true` with a clear message if there are not enough credits. The message tells the model to fall back to `duckduckgo__web_search` or `tavily__web_search`. The minimum-credits threshold is `FIRECRAWL_MIN_CREDITS` (default 4; set to `0` to disable — not recommended on a free-tier key, a runaway agent loop can otherwise burn all 1,000 credits in a few iterations).
+```json
+{
+  "success": true,
+  "data": {
+    "web": [
+      { "url":          "https://example.com",
+        "title":        "Example",
+        "description":  "An example page.",
+        "markdown":     "...",
+        "metadata":     { ... } }
+    ]
+  },
+  "creditsUsed": 7
+}
+```
 
-The full `credits` snapshot is included in **every** successful response, so the model can see its budget drop across calls and act accordingly.
+The mapper drops every entry where `url` is missing (these are search-engine noise — entries the upstream accepted but couldn't resolve), keeps everything else, caps the list at `max_results` (post-clamp), and applies the per-result markdown truncation.
+
+### 4.2 `scrape_url`
+
+Firecrawl `/v2/scrape` returns:
+
+```json
+{
+  "success": true,
+  "data": {
+    "markdown": "...",
+    "metadata": {
+      "title": "Example",
+      "description": "...",
+      "language": "en",
+      "source_url": "https://example.com",
+      "url":       "https://example.com",
+      "status_code": 200
+    }
+  }
+}
+```
+
+When `data.success` is `false`, the call is treated as an upstream error and surfaced as a `ToolError`. When `data.markdown` is empty but `success: true`, the tool still returns a structured response with empty `markdown` and the metadata, so the model can see that the page was scraped but had no markdown body.
 
 ---
 
 ## 5. Configuration
 
-All configuration is via environment variables. The Rust agent forwards the relevant ones when it spawns the server via the `env_pass` allow-list in `config/mcp.toml` — see the agent's [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) §3 for the env-forwarding semantics.
+All configuration is via environment variables. See `.env.example` for the full list with defaults.
 
-| Variable | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `FIRECRAWL_API_KEY` | yes | – | Firecrawl API key. Get a free one at <https://www.firecrawl.dev>. Free tier: 1,000 credits/month. |
-| `FIRECRAWL_API_KEY_2` | no | – | Alias for `FIRECRAWL_API_KEY`. Accepted because the agent's `.env` historically mis-spells it as `FIRECLAW_API_KEY` (one W). The server reads `FIRECRAWL_API_KEY` first, then `FIRECLAW_API_KEY`, then `FIRECRAWL_API_KEY_2`. |
-| `FIRECRAWL_MIN_CREDITS` | no | `4` | Refuse a call if the local credit counter is at or below this value. `0` disables the guard. |
-| `DEEP_MAX_MARKDOWN_CHARS` | no | `8000` | Per-result markdown cap (~2k tokens). Prevents a single call from blowing the agent's context budget. |
-| `DEEP_TRUNCATION_MARKER` | no | `"\n\n[…markdown truncated to fit the context budget; the full body is in the Firecrawl cache…]"` | String appended to a truncated body. The model sees the cut and knows it's intentional. |
-| `FIRECRAWL_CACHE_DIR` | no | `./cache/firecrawl` | On-disk cache directory. Gitignored. |
-| `FIRECRAWL_CACHE_TTL_SECS` | no | `86400` | Cache freshness window, seconds. `0` disables. |
-| `MCP_LOG_LEVEL` | no | `WARNING` | `DEBUG` / `INFO` / `WARNING`. Logs go to **stderr** (stdout is the JSON-RPC stream). |
-
----
-
-## 6. Per-result markdown cap (context-budget protection)
-
-Firecrawl can return full pages 50k+ characters long. A single `web_search` call with `max_results=5` could dump 250k+ characters into the agent's context and blow the context budget in one iteration. The cap keeps each result at `DEEP_MAX_MARKDOWN_CHARS` (default 8000, ~2k tokens), so a 5-result call adds at most ~10k tokens — well under the per-iteration budget. The full content stays in the Firecrawl cache; re-querying with a narrower scope re-uses the cache hit (no credits burned).
-
-**Always populate `markdown_chars` and `markdown_truncated_chars`** in the response. The model uses them to decide whether to ask for a narrower follow-up query (e.g. targeting a specific section of the page).
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `FIRECRAWL_API_KEY` | – | Firecrawl API key. **Required for all tools.** `FIRECLAW_API_KEY` is also accepted as a legacy alias (the project name uses the misspelling; the alias exists only for parity with older deployment scripts — prefer the correctly-spelled variable). |
+| `FIRECRAWL_TRANSPORT` | `http` | `http` (Streamable HTTP) or `stdio`. |
+| `FIRECRAWL_HOST` | `127.0.0.1` | Bind address for HTTP transport. Loopback by design. |
+| `FIRECRAWL_PORT` | `8000` | Port for HTTP transport. |
+| `FIRECRAWL_PATH` | `/mcp` | URL path for the MCP endpoint. |
+| `FIRECRAWL_CACHE_DIR` | `./cache/firecrawl` | On-disk cache directory. Gitignored. |
+| `FIRECRAWL_CACHE_TTL_SECS` | `86400` | Cache freshness window, seconds. `0` disables the cache. |
+| `FIRECRAWL_MIN_CREDITS` | `4` | Refuse a `web_search` call if the local credit counter is at or below this value. `0` disables the guard (not recommended on a free-tier key). |
+| `FIRECRAWL_MAX_MARKDOWN_CHARS` | `8000` | Per-result markdown cap (~2k tokens). Prevents a single call from blowing the agent's context budget. |
+| `FIRECRAWL_MIN_INTERVAL_MS` | `0` | Minimum spacing between upstream Firecrawl calls in milliseconds. `0` disables the limiter. |
+| `FIRECRAWL_HTTP_TIMEOUT_S` | `60` | Upstream HTTP request timeout in seconds. |
+| `MCP_LOG_LEVEL` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. Logs go to **stderr** (stdout is the JSON-RPC stream). `FASTMCP_LOG_LEVEL` is honoured as a fallback. |
 
 ---
 
-## 7. Caching
+## 6. Caching
 
-On-disk TTL cache mirroring the format of the bundled MCP's Firecrawl cache. Key = normalised query. File name = `<slug>-<fnv1a64>.json`. Envelope:
+On-disk TTL cache covering both tools. Key = normalised input (trimmed, inner whitespace collapsed, lowercased for queries; canonical URL for scrapes). File name = `<slug>-<fnv1a64>.json`. Envelope:
 
 ```json
-{ "fetched_at_unix": 1730000000,
-  "query": "...",
-  "results": [ { "title": "...", "url": "...",
-                 "markdown": "...",     // full, untruncated
-                 "markdown_chars": 12345 } ],
-  "credits_used_this_call": 7,
-  "fetched_credits_snapshot": { ... } }
+{
+  "fetched_at_unix": 1730000000,
+  "kind": "search" | "scrape",
+  "input": { "query": "..." } | { "url": "..." },
+  "response": { ... structured_content minus credits_used_this_call and credits ... }
+}
 ```
 
-**Important:** the cache stores the **full, untruncated** markdown body. The truncation in §6 is a presentation-time concern, not a storage-time one. This way, if the operator changes `DEEP_MAX_MARKDOWN_CHARS`, the next call still has the full body to truncate from.
+**Important:** the cache stores the **full, untruncated** markdown body. The truncation in §3 is a presentation-time concern, not a storage-time one. This way, if the operator changes `FIRECRAWL_MAX_MARKDOWN_CHARS`, the next call still has the full body to truncate from. The credit snapshot is **not** cached — every call returns a fresh view, but the cache hit does NOT decrement the credit counter.
 
-Cache hits **do not** decrement the credit counter — that's the point of the cache. The `cache: "hit"` field in the response makes this visible to the model.
+**Failure semantics:** a missing, stale, corrupt, or unwritable cache entry **never fails the call**. The tool logs a `warn` and degrades to a plain uncached call.
+
+**Bypass:** `web_search` and `scrape_url` each take a `force_refresh: bool` arg; when `true`, the cache is read for nothing and the call always hits Firecrawl. The response's `cache` field reports `"bypassed"` so the model can verify that the bypass actually happened.
 
 The cache directory is gitignored. Delete any time to force fresh lookups.
 
 ---
 
-## 8. Install / setup
+## 7. Credit tracking
+
+The most important piece of operational logic in the server. Firecrawl costs credits; the model needs to know how many it has left, and the server needs to refuse calls that would exhaust them. The tracking has two parts:
+
+1. **Startup probe** — when the server starts, it calls `Firecrawl.get_credit_usage()` once and caches `remaining_credits`, `plan_credits`, and `billing_period_end` in memory. The probe is a metadata endpoint; it doesn't consume credits. If it fails, the server starts with `remaining_credits = None` and the first call surfaces a clear "credits unknown" note in `credit_status()`.
+2. **Per-call decrement** — every successful `web_search` and `scrape_url` response includes a `creditsUsed` field. The server subtracts that from the cached counter after a successful call, so the running balance stays accurate without re-probing.
+
+**Pre-call guard:** before every `web_search`, the server checks the cached counter and raises a `ToolError` with a clear message if there are not enough credits. The message tells the model to fall back to a free sibling tool or call `credit_status()` to confirm the situation. The minimum-credits threshold is `FIRECRAWL_MIN_CREDITS` (default 4; set to `0` to disable — not recommended on a free-tier key).
+
+The full `credits` snapshot is included in **every** successful response, so the model can see its budget drop across calls and act accordingly. `credit_status()` exposes it on demand without burning credits.
+
+---
+
+## 8. Per-result markdown cap (context-budget protection)
+
+Firecrawl can return full pages 50k+ characters long. A single `web_search` call with `max_results=5` could dump 250k+ characters into the agent's context and blow the context budget in one iteration. The cap keeps each result at `FIRECRAWL_MAX_MARKDOWN_CHARS` (default 8000, ~2k tokens), so a 5-result call adds at most ~10k tokens — well under the per-iteration budget. The full content stays in the Firecrawl cache and in this server's on-disk cache; re-querying with a narrower scope re-uses the cache hit (no credits burned).
+
+**Always populate `markdown_chars` and `markdown_truncated_chars`** in the response. The model uses them to decide whether to ask for a narrower follow-up query (e.g. targeting a specific section of the page) or to call `scrape_url` on the same URL with a tighter focus.
+
+---
+
+## 9. Prompts
+
+### 9.1 `research_topic`
+
+A reusable user-message prompt that sets up a single `web_search` call. Args: `topic: str`. Returns a user message that:
+
+1. Tells the model to use `web_search` with a canonical topic name (not a question).
+2. Sets `max_results=5`.
+3. Defines the empty-result fallback: rephrase once, then fall back to the model's own knowledge and say so.
+4. Includes the credit-budget reminder: every response includes `credits`; switch to a free search tool when `remaining_credits` drops under ~50.
+
+Registered on the same FastMCP instance as the tools. No extra setup.
+
+### 9.2 `fetch_document`
+
+A reusable user-message prompt that sets up a single `scrape_url` call with a `focus` question. Args: `url: str`, `focus: str`. Returns a user message that:
+
+1. Tells the model to use `scrape_url` on the URL.
+2. Asks the model to summarise the markdown around `focus`, dropping irrelevant sections before quoting.
+3. Reminds the model that per-page markdown is capped and the cut is visible via `markdown_truncated_chars`.
+
+Registered on the same FastMCP instance as the tools. No extra setup.
+
+---
+
+## 10. Install / setup
 
 ```bash
-cd rust-agent-firecrawl-mcp
-python3 -m venv .venv      # or: uv venv --python 3.12 .venv
+cd fireclaw-search-mcp
+python3 -m venv .venv           # or: uv venv --python 3.12 .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e .                # or: uv pip install -e .
+cp .env.example .env
+$EDITOR .env
 ```
 
-**Dependencies (suggested):**
+**Dependencies (pinned, per the project's `pyproject.toml`):**
 
-- `fastmcp>=2.0` — MCP server framework. (The project is `prefecthq/fastmcp` on GitHub but published as `fastmcp` on PyPI; it is the standard framework for building MCP servers in Python and powers most of the Python MCP ecosystem.)
-- `firecrawl-py>=4.0` — official Firecrawl SDK. The v2 client lives under `firecrawl.v2` and exposes `search()` plus `get_credit_usage()`.
+- `fastmcp==4.0.11` — MCP server framework, the standalone PrefectHQ package.
+- `httpx>=0.27` — async HTTP client. The Firecrawl v2 API is a JSON over HTTPS surface with a Bearer token; an SDK adds no value here, and httpx gives us fail-open caching and timeout control with a single dependency.
 
-Tested with Python 3.10+. Other interpreters are fine as long as the `rmcp` 0.8 client on the agent side negotiates `2024-11-05` (the version `fastmcp` 2.x ships).
+Tested with Python 3.12. Works on 3.10+.
 
 ---
 
-## 9. Run by hand (for debugging)
+## 11. Run by hand
 
 ```bash
-# Set the API key first.
-export FIRECRAWL_API_KEY=fc-...
+# HTTP (default) — listen on http://127.0.0.1:8000/mcp
+python3 -m fireclaw_search_mcp
 
-# The server speaks JSON-RPC over stdio. A blank stdin will let
-# it sit idle; pipe a real `initialize` + `tools/list` exchange
-# to see the registered tool schema. The startup probe against
-# `get_credit_usage()` will run before the first call, so a
-# bad key surfaces as a clear error in the logs.
-python3 -m firecrawl_mcp
+# Stdio — for clients that spawn the server as a child process
+FIRECRAWL_TRANSPORT=stdio python3 -m fireclaw_search_mcp
 ```
+
+A blank stdin in stdio mode lets the server sit idle. Point any MCP client (opencode, Claude Desktop, VS Code, Cursor) at the URL or spawn the process; see `docs/DEPLOYMENT.md` for the connection recipes.
 
 ---
 
-## 10. Integration with `rust-agent`
+## 12. Deployment
 
-Add a single entry to `config/mcp.toml` in the `rust-agent` repo:
+Two supported paths. Both rely on the server binding to `127.0.0.1`; neither requires the server itself to know it's being forwarded.
 
-```toml
-[[mcp.servers]]
-name = "firecrawl"
-command = ["/abs/path/to/rust-agent-firecrawl-mcp/.venv/bin/python",
-           "/abs/path/to/rust-agent-firecrawl-mcp/firecrawl_mcp/__main__.py"]
-env_pass = ["FIRECRAWL_API_KEY", "PATH", "HOME"]
-enabled = true
-```
+1. **VS Code "Forward a Port"** (recommended). Open the Ports panel, forward `8000`, copy the URL, point your client at `<forwarded-url>/mcp`. The tunnel runs through Microsoft's relay — no public hostname to block.
+2. **ngrok** (fallback). `ngrok http 8000`, point your client at `<ngrok-url>/mcp`. Free-tier URLs are publicly enumerable; corporate networks often block them.
 
-Restart the agent. The model now sees the tool under its qualified name `firecrawl__web_search`. To temporarily disable without removing the entry, set `enabled = false` (the agent parses and validates the entry but skips spawning).
-
-The agent's `.env` (or wherever the operator keeps the key) should export `FIRECRAWL_API_KEY`. The agent's `config/mcp.toml` entry's `env_pass` allow-list forwards it to the spawned subprocess.
-
-The default `web-search` MCP entry in `config/mcp.toml` (the bundled DDG + Firecrawl one) **must be removed or disabled** before the new Firecrawl entry is enabled, or the agent will register two `web_search` shaped tools and the model will be confused about which to use.
+For both, the server is started with `python3 -m fireclaw_search_mcp`. No auth is configured — the loopback bind + tunnel auth is the access control. See `docs/DEPLOYMENT.md` for the full step-by-step.
 
 ---
 
-## 11. Failure modes and how the model reacts
+## 13. Failure modes and how the model reacts
 
 | What goes wrong | What the tool does | What the model sees |
 | --- | --- | --- |
-| `FIRECRAWL_API_KEY` not set | `is_error: true` on first call (lazy — no startup probe without a key) | "Firecrawl API key not set; reach for `duckduckgo__web_search` or `tavily__web_search` instead." |
-| `FIRECRAWL_API_KEY` invalid (`401`) | `is_error: true` with the 401 message | "Firecrawl rejected the API key." Operator notices; model falls back. |
-| Firecrawl out of credits (`402`) | The pre-check raises `is_error: true` **before** the API call | "Firecrawl is out of credits for this billing period. Use `duckduckgo__web_search` or `tavily__web_search`." No credit wasted. |
-| Firecrawl rate limit (`429`) | The SDK retries with backoff (default 3 attempts); on exhaustion, `is_error: true` | A rate-limit error. The model can wait or fall back. |
-| `get_credit_usage()` probe fails at startup | Server starts with `remaining_credits = 0`; the first call returns an "credits unknown" error | The model can still try the call; the pre-check is a guard, not a hard requirement. Operator sees a `warn` log. |
-| A result's page body is huge | Per-result cap at `DEEP_MAX_MARKDOWN_CHARS`, with the truncation marker and the `markdown_chars` / `markdown_truncated_chars` fields | A normal success with a clearly marked cut. The model can re-query with a narrower scope to read more. |
+| `FIRECRAWL_API_KEY` not set | `credit_status()` reports the API key is missing; `web_search` / `scrape_url` raise `ToolError("FIRECRAWL_API_KEY not set")` on the first call | A clear error. Operator notices; no accidental credit spend. |
+| `FIRECRAWL_API_KEY` invalid (`401`) | `ToolError("Firecrawl rejected the API key")` | A clear HTTP error. Operator notices; model falls back. |
+| Firecrawl out of credits (`402` / `insufficient_credits`) | The pre-check raises `ToolError("Firecrawl is out of credits for this billing period")` before the API call | A clear budget error. No credit wasted. The model can call `credit_status()` to confirm. |
+| Firecrawl rate limit (`429`) | `ToolError("Firecrawl is rate-limiting this key")` | A rate-limit error. The model can wait a few seconds or fall back. |
+| `get_credit_usage()` probe fails at startup | Server starts with `remaining_credits = None`; the first call proceeds without a pre-check; `credit_status()` reports a "credits unknown" note | A normal call with a note. The model can still try; the pre-check is a guard, not a hard requirement. Operator sees a `warn` log. |
+| A result's page body is huge | Per-result cap at `FIRECRAWL_MAX_MARKDOWN_CHARS`, with the truncation marker and the `markdown_chars` / `markdown_truncated_chars` fields | A normal success with a clearly marked cut. The model can re-query with a narrower scope or call `scrape_url` on the same URL with a tighter focus. |
 | Cache directory unwritable | Logs `warn`; falls through to a plain uncached call | The tool still works, just slower on repeat queries (and credits will be spent). |
-| MCP server child dies | The `rmcp` client surfaces an `ErrorData`; the tool returns a protocol-level error | A connection error. The supervisor loop's "two empty iterations" rule nudges the model. |
-| Server didn't spawn (venv missing or no key) | `build_agent` returns an error at agent startup | The agent refuses to start with a clear message naming the server and the command. **No silent fallback** — the design choice documented in `docs/mcp.md` §7. |
+| Cache file corrupt | Logs `warn`; falls through to a fresh upstream call | Same. |
+| Foreign `Origin` header | Accepted when the server is bound to `127.0.0.1` (DNS rebinding isn't possible) | The probe flags this as a WARN; see `docs/DEPLOYMENT.md` for when to enable `http_host_origin_protection`. |
+| Server didn't start (port in use, venv missing, key missing) | Process exits with a clear log line on stderr | The client gets a connection error. No silent fallback. |
 
 ---
 
-## 12. Context-budget protection
+## 14. Acceptance criteria
 
-Two complementary mechanisms keep the agent from blowing the MiniMax-M3 1M-token context window on its own:
+The implementation is "good enough to ship" when **all** of the following hold:
 
-1. **Per-result markdown cap** (this server, §6). Keeps each result's contribution to the agent's context bounded.
-2. **Context-pressure guard in the supervisor loop** (agent side, `loop_strategy::CONTEXT_PRESSURE_PROMPT`). When the estimated chat-history size crosses `RUST_AGENT_CONTEXT_PRESSURE_THRESHOLD_TOKENS` (default 800k, ~80% of MiniMax-M3's 1M window), the supervisor injects a directive to stop searching, commit findings to the skill-set document, and call `finalize_skill_set`. The prompt fires at most once per run.
-
-Together these mean: even in the worst case (8 iterations × 8 multi-turn tool calls × a 5-result deep search per call), the agent caps its input at roughly 8 × 8 × 10k = 640k tokens, with the pressure guard catching anything that slips through. The model has ~200k tokens of headroom to generate its final answer.
-
----
-
-## 13. Acceptance criteria (minimum viable)
-
-The implementation is "good enough to unblock the agent" when **all** of the following hold:
-
-1. `pip install -e .` from a clean checkout succeeds on Python 3.10+.
-2. `python3 -m firecrawl_mcp` starts, runs the credit-usage probe (visible in stderr at `MCP_LOG_LEVEL=INFO`), and responds to a manual `initialize` + `tools/list` JSON-RPC exchange.
-3. The advertised tool is exactly `web_search`, with the input schema and description in §3.
-4. A live call against Firecrawl with a real key returns at least one result with title, URL, and (possibly truncated) markdown.
-5. The response includes the `credits` snapshot and `credits_used_this_call` is non-zero.
-6. A second identical call within the cache TTL produces a response with `cache: "hit"` and **no** decrement to the credit counter.
-7. Setting `FIRECRAWL_API_KEY` to an invalid value (or unsetting it on a real key) returns `is_error: true` with a clear message.
-8. Setting `FIRECRAWL_MIN_CREDITS=999` with a fresh free-tier key (1000 credits) refuses the first call with the "out of credits" message.
-9. A result whose page body exceeds `DEEP_MAX_MARKDOWN_CHARS` is truncated and the `markdown_chars` / `markdown_truncated_chars` fields are populated correctly.
-10. Spawning this server from the agent's `config/mcp.toml` succeeds, the model sees the tool as `firecrawl__web_search`, and a one-shot request (`cargo run -- run --request "How do I write a custom JSON logger in tokio?"`) triggers at least one call to it and ends with a non-empty final reply that cites one of the returned URLs.
+1. `pip install -e .` from a clean checkout succeeds on Python 3.10+. ✅
+2. With a real `FIRECRAWL_API_KEY` set, `python3 -m fireclaw_search_mcp` starts on `http://127.0.0.1:8000/mcp` and answers `server/discover` with `supportedVersions: ["2026-07-28"]`. ✅
+3. The advertised tools are exactly `web_search`, `scrape_url`, and `credit_status`, with the input schemas and descriptions in §3. ✅
+4. The advertised prompts are exactly `research_topic` and `fetch_document`. ✅
+5. A live `web_search` call against Firecrawl with a real key returns at least one result with title, URL, and (possibly truncated) markdown. ✅
+6. The response includes the `credits` snapshot and `credits_used_this_call` is non-zero. ✅
+7. A second identical `web_search` call within the cache TTL produces a response with `cache: "hit"` and **no** decrement to the credit counter. ✅
+8. A `scrape_url` call against a known URL returns the page body, metadata, and a `credits` snapshot. ✅
+9. A second identical `scrape_url` call within the cache TTL produces a response with `cache: "hit"`. ✅
+10. Setting `FIRECRAWL_API_KEY` to an invalid value (or unsetting it on a real key) returns `ToolError` with a clear message from the affected tools. ✅
+11. Setting `FIRECRAWL_MIN_CREDITS=999` with a fresh free-tier key (1000 credits) refuses the first `web_search` call with the "out of credits" message. ✅
+12. A result whose page body exceeds `FIRECRAWL_MAX_MARKDOWN_CHARS` is truncated and the `markdown_chars` / `markdown_truncated_chars` fields are populated correctly. ✅
+13. The wire probe (`scripts/probe_mcp_server.py`) reports 0 failures against the live server. ✅
+14. The in-process test suite (`pytest`) reports 0 failures in both `mode="auto"` and `mode="legacy"`. ✅
 
 ---
 
-## 14. Test plan
+## 15. Test plan
 
-Unit tests (hermetic, no network):
+Unit tests (hermetic, no network) live in `tests/`:
 
-- `cache_round_trip_serves_second_call_from_disk` — write a cache entry, read it back, assert `cache: "hit"` and that the credit counter was **not** decremented.
-- `cache_stores_full_untruncated_markdown` — write a result whose body is 20k chars, read it back, assert the cached `markdown` is the full 20k, and the response-time truncation happens after the cache read.
-- `count_is_clamped_to_1_through_10` — same shape as the DDG tests.
-- `per_result_markdown_is_capped` — feed a result with a 50k-char body, assert response `markdown` is ≤ 8000 chars, the truncation marker is present, and `markdown_chars` / `markdown_truncated_chars` are populated.
-- `credit_counter_decrements_after_successful_call` — start with `remaining_credits = 100`, simulate a call with `creditsUsed = 7`, assert the post-call counter is 93.
-- `credit_guard_refuses_call_below_min_credits` — start with `remaining_credits = FIRECRAWL_MIN_CREDITS`, assert the call raises `is_error: true` without hitting the network.
-- `missing_or_invalid_api_key_returns_clear_error` — unset `FIRECRAWL_API_KEY`, assert the first call returns `is_error: true` with a "key not set" message; set it to an invalid value, assert the call returns `is_error: true` with a "rejected" message.
+- `test_normalize.py` — query and URL normalisation, slug, FNV-1a 64-bit hash.
+- `test_cache.py` — round trip, normalisation equivalence, stale entry, corrupt file, unwritable dir, atomic write.
+- `test_rate_limit.py` — disabled at 0 ms, serial waits spaced, concurrent waits queued.
+- `test_firecrawl.py` — search and scrape response mapping (entry filtering, markdown truncation, per-result fields, credit debit), credit-usage probe mapping.
+- `test_server.py` — tool/prompt advertisement, basic search, scrape, count clamp, empty result, cache hit, both client modes, force_refresh bypass, credit guard, missing-key error.
+- `test_server_integration.py` — real Firecrawl calls, skipped unless `FIRECRAWL_NETWORK_TESTS=1`.
 
-Integration tests (network, gated on the venv and a real key existing):
+End-to-end (manual):
 
-- `mcp_server_advertises_web_search` — handshake, `tools/list`, assert exactly one tool named `web_search`.
-- `basic_search_returns_results_with_credits_snapshot` — call with a canonical query, assert `results.len() >= 1`, `credits_used_this_call > 0`, and the `credits` object is present.
-- `second_call_within_ttl_serves_from_cache` — call twice, assert the second has `cache: "hit"`.
-- `truncation_marker_appears_on_long_pages` — find a query whose first result is > `DEEP_MAX_MARKDOWN_CHARS` (a known Wikipedia long article is a good fixture), assert the marker is present and the per-result fields are correct.
-
-End-to-end (manual, smoke checklist from `docs/testing.md`):
-
-- `cargo run -- run --request "Design a tokio JSON logger skill set"`
-  — assert the trace contains at least one `firecrawl__web_search` call, and the final Markdown cites at least one URL from the results.
+- `python3 -m fireclaw_search_mcp` then connect from any modern MCP client (opencode, VS Code, Claude Desktop, Cursor) and confirm `web_search` and `scrape_url` appear and return results.
+- Call `credit_status()` and confirm it returns a credit snapshot without burning credits.
 
 ---
 
-## 15. Out of scope for v0.1
+## 16. Out of scope for v0.1
 
-- **No other Firecrawl endpoints.** No `/v2/scrape` (single-URL scrape), no `/v2/crawl` (whole-site crawl), no `/v2/extract` (structured extraction). The single tool is search + scrape in one call. URL-by-URL scrape is out of scope for v0.1; if the agent ever needs it, it can be added as a second tool on the same server.
-- **No async polling.** Firecrawl's `/v2/extract` is async; the search endpoint is sync. This server only uses the sync search endpoint.
-- **No rate-limit-aware retries beyond the SDK default.** The Firecrawl SDK retries 429s with backoff (default 3 attempts). Custom retry policies are out of scope.
-- **No HTTP transport.** Stdio only, per `docs/mcp.md` §6. When the agent's HTTP transport lands, this server may be wrapped behind a small stdio-to-HTTP shim, or a parallel HTTP entry point can be added later — out of scope for v0.1.
+- **No other Firecrawl endpoints.** No `/v2/crawl` (whole-site crawl), no `/v2/extract` (structured extraction), no `/v2/map` (URL discovery). The three tools cover search, single-URL scrape, and credit status only. If a future need arises (e.g. crawl), it can be added as a fourth tool on the same server.
+- **No async polling.** None of the three tools Firecrawl exposes that are async (`/v2/crawl`, `/v2/extract`, `/v2/deep-research`) are exposed; this server only uses sync endpoints.
+- **No rate-limit-aware retries beyond a single attempt.** The upstream rate limiter (§7 `FIRECRAWL_MIN_INTERVAL_MS`) spaces calls out, and the `429` response is surfaced to the model. Custom retry policies with backoff are out of scope.
+- **No automatic change detection.** The user's wishlist mentions "if another mechanism is implemented to allow identifying if the source where the data was retrieved was updated" — that lives behind `/v2/scrape`'s `changeTracking` format and is left as a future tool on the same server. For v0.1, the `force_refresh` arg is the manual escape hatch.
+- **No proxy, geolocation, or per-call scrape options.** `web_search` always asks for `formats: ["markdown"]`; `scrape_url` always asks for `formats: ["markdown"]` with `onlyMainContent: true`. Operators can change this server-side but the tools don't expose the knobs.
+- **No parallel upstream calls.** A single in-flight upstream request is the unit. The shared `min_interval_ms` mutex (when enabled) serialises them.
 
 ---
 
-## 16. References
+## 17. References
 
-- Agent integration overview: [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) in the `rust-agent` repo.
-- Agent's `tools::mcp` module-level reference: [`docs/modules/tools-mcp.md`](https://github.com/example/rust-agent/blob/main/docs/modules/tools-mcp.md).
-- Existing bundled DDG + Firecrawl MCP (split source for this work): [`mcp-servers/web-search/`](https://github.com/example/rust-agent/tree/main/mcp-servers/web-search) in the `rust-agent` repo — specifically `server.py` (the `web_search_deep` / `_do_firecrawl_deep_search` path) and `docs/architecture.md` (the credit-tracking and per-result-markdown-cap contract). When the bundled MCP is retired, that document moves here.
-- Firecrawl API: <https://docs.firecrawl.dev>.
-- `firecrawl-py` SDK: <https://github.com/mendableai/firecrawl-py>.
-- MCP specification: <https://modelcontextprotocol.io>.
-- `fastmcp` (Python MCP server framework): <https://github.com/PrefectHQ/fastmcp>.
+- MCP specification (target revision): https://modelcontextprotocol.io/specification/2026-07-28/
+- MCP `server/discover`: https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/discover
+- Firecrawl v2 API: https://docs.firecrawl.dev
+- Firecrawl v2 search: https://docs.firecrawl.dev/api-reference/endpoint/search
+- Firecrawl v2 scrape: https://docs.firecrawl.dev/api-reference/endpoint/scrape
+- Firecrawl v2 credit usage: https://docs.firecrawl.dev/api-reference/endpoint/credit-usage
+- FastMCP (Python MCP server framework): https://github.com/PrefectHQ/fastmcp and https://gofastmcp.com
+- VS Code Streamable HTTP support: https://code.visualstudio.com/api/extension-guides/ai/mcp
